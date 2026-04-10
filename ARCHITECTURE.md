@@ -62,6 +62,14 @@ Standard ASP.NET minimal API. Three endpoints:
 
 PredictionEngine is not thread-safe, so HTTP mode wraps it in a lock. For higher throughput, this could be swapped to `PredictionEnginePool`.
 
+The HTTP pipeline is layered as:
+
+```
+request -> ForwardedHeaders (opt-in) -> RateLimiter -> API key middleware -> endpoint
+```
+
+Forwarded headers runs first so the rate limiter sees the real client IP when behind a proxy. Rate limiting runs before auth so a flood of unauthenticated requests is capped before it can exercise the key-comparison path.
+
 ### MCP mode (--mcp flag)
 
 JSON-RPC 2.0 over stdin/stdout. Implements the MCP handshake (initialize, tools/list) and exposes two tools:
@@ -70,6 +78,17 @@ JSON-RPC 2.0 over stdin/stdout. Implements the MCP handshake (initialize, tools/
 - `analyze_token` — same as GET /api/analyze/{mint}
 
 Designed for Claude Code and Claude Desktop. The AI agent discovers available tools at connection time and decides when to invoke them based on conversation context.
+
+## Security controls
+
+| Layer | Mechanism | File |
+|-------|-----------|------|
+| Input validation | Base58 regex on mint address blocks SSRF before URL construction | [TokenAnalyzer.cs](RugPullServer/TokenAnalyzer.cs) |
+| Authentication | `X-API-Key` header compared with `CryptographicOperations.FixedTimeEquals` | [Program.cs](RugPullServer/Program.cs) |
+| Rate limiting | Fixed window, 30/min, partitioned by SHA256(API key) or client IP | [Program.cs](RugPullServer/Program.cs) |
+| Proxy support | Opt-in `ForwardedHeaders` via `TRUST_FORWARDED_HEADERS=1` | [Program.cs](RugPullServer/Program.cs) |
+
+Configuration is entirely env var driven — no secrets in code, no secrets in config files. MCP mode returns before any HTTP pipeline code runs, so stdio clients bypass these layers (the MCP transport has its own trust model: the parent process owns the child).
 
 ## Project dependencies
 

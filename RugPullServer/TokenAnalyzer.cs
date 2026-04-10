@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace RugPullServer;
 
@@ -8,6 +9,9 @@ namespace RugPullServer;
 /// </summary>
 public class TokenAnalyzer
 {
+    private static readonly Regex MintAddressRegex = new(
+        @"^[1-9A-HJ-NP-Za-km-z]{32,44}$", RegexOptions.Compiled);
+
     private readonly HttpClient _http;
 
     public TokenAnalyzer(HttpClient http)
@@ -18,6 +22,9 @@ public class TokenAnalyzer
 
     public async Task<TokenAnalysis?> AnalyzeAsync(string mintAddress)
     {
+        if (string.IsNullOrEmpty(mintAddress) || !MintAddressRegex.IsMatch(mintAddress))
+            return null;
+
         var response = await _http.GetAsync(
             $"https://api.dexscreener.com/latest/dex/tokens/{mintAddress}");
 

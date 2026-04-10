@@ -104,6 +104,8 @@ curl -X POST http://localhost:5000/api/check \
   }'
 ```
 
+When auth is enabled (see [Security](#security)), add `-H "X-API-Key: your-key"` to every `/api/*` call.
+
 ### MCP mode (for Claude Code / Claude Desktop)
 
 ```bash
@@ -118,6 +120,56 @@ Register with Claude Code:
 ```bash
 claude mcp add rugpull-detector -- dotnet run --project /path/to/RugPullServer -- --mcp
 ```
+
+## Security
+
+The HTTP API ships with three layers of protection. All are opt-in by env var so `dotnet run` still works out of the box for local development.
+
+### Input validation
+
+Mint addresses are validated against the Base58 alphabet (32-44 chars) before any outbound request. Invalid input returns 404 without ever hitting DexScreener — blocks SSRF attempts like path traversal or URL injection.
+
+### API key authentication
+
+Set `RUGPULL_API_KEY` to enable header-based auth on `/api/*` endpoints. `/health` remains open for liveness checks.
+
+```bash
+# Generate a strong key
+openssl rand -base64 32
+
+# Start the server with auth enabled
+RUGPULL_API_KEY="your-generated-key" dotnet run
+```
+
+Clients must send `X-API-Key: your-generated-key` on every `/api/*` request. Comparison uses `CryptographicOperations.FixedTimeEquals` to prevent timing attacks. If the env var is not set, the server logs a warning and runs with auth disabled (useful for local demos).
+
+**Never commit your API key.** Store it in a password manager, a gitignored `.env` file, or your deployment platform's secrets store.
+
+### Rate limiting
+
+Fixed window, 30 requests per minute, partitioned per client:
+- If `X-API-Key` is present, the bucket is keyed by SHA256(key) — each client gets their own quota
+- Otherwise the bucket falls back to client IP
+
+Excess requests return HTTP 429. `/health` is not rate limited.
+
+### Deployment behind a reverse proxy
+
+When running behind Cloudflare Tunnel, nginx, Caddy, or any proxy that terminates TLS, set `TRUST_FORWARDED_HEADERS=1` so the rate limiter sees the real client IP from `X-Forwarded-For` instead of the proxy's IP:
+
+```bash
+TRUST_FORWARDED_HEADERS=1 RUGPULL_API_KEY="your-key" dotnet run
+```
+
+**Do not set this on a directly-exposed server** — a malicious client could spoof `X-Forwarded-For` to evade rate limiting.
+
+### Production deployment checklist
+
+- [ ] Terminate TLS at a reverse proxy (Cloudflare Tunnel, Caddy, nginx). Never expose plain HTTP publicly — API keys would travel in the clear.
+- [ ] Set `RUGPULL_API_KEY` to a value generated from `openssl rand -base64 32`
+- [ ] Set `TRUST_FORWARDED_HEADERS=1` if and only if traffic actually flows through a trusted proxy
+- [ ] Rotate the key immediately if it ever leaks (code push, log leak, screenshot, etc.)
+- [ ] Distribute the key to each client out-of-band (DM, password manager share, never in a public channel)
 
 ## Heuristic scoring
 
