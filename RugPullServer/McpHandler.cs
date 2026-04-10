@@ -137,18 +137,34 @@ public static class McpHandler
         JsonElement id, JsonElement toolArgs, TokenAnalyzer analyzer)
     {
         string mintAddress = toolArgs.GetProperty("mintAddress").GetString() ?? "";
-        var analysis = await analyzer.AnalyzeAsync(mintAddress);
+        var outcome = await analyzer.AnalyzeAsync(mintAddress);
 
-        if (analysis == null)
+        object payload = outcome switch
         {
-            Respond(id, new
+            AnalysisFound found => (object)found.Analysis,
+            AnalysisNotFound nf => new
             {
-                content = new[] { new { type = "text", text = $"No pools found for {mintAddress}. Token may not be listed on any Solana DEX." } }
-            });
-            return;
-        }
+                error = "Token not found",
+                mintAddress,
+                reason = nf.Reason,
+                suggestion = nf.Suggestion
+            },
+            AnalysisInvalidInput invalid => new
+            {
+                error = "Invalid mint address",
+                mintAddress,
+                reason = invalid.Reason
+            },
+            AnalysisUpstreamError err => new
+            {
+                error = "Upstream API error",
+                mintAddress,
+                reason = err.Reason
+            },
+            _ => new { error = "Unknown outcome", mintAddress }
+        };
 
-        var resultText = JsonSerializer.Serialize(analysis, JsonOpts);
+        var resultText = JsonSerializer.Serialize(payload, JsonOpts);
         Respond(id, new { content = new[] { new { type = "text", text = resultText } } });
     }
 
