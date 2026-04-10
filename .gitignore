@@ -1,0 +1,16 @@
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.idea/
+*.DS_Store
+
+# Training data (34MB+ CSV, users generate from SolRPDS repo)
+*.csv
+
+# Trained model output (users retrain locally)
+rugpull_model.zip
+
+# Dataset repo (cloned separately)
+SolRPDS/
