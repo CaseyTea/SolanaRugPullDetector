@@ -20,34 +20,101 @@ public class TokenAnalyzer
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("RugPullDetector/1.0");
     }
 
-    public async Task<TokenAnalysis?> AnalyzeAsync(string mintAddress)
+    public async Task<AnalysisOutcome> AnalyzeAsync(string mintAddress)
     {
-        if (string.IsNullOrEmpty(mintAddress) || !MintAddressRegex.IsMatch(mintAddress))
-            return null;
+        if (string.IsNullOrEmpty(mintAddress))
+            return new AnalysisInvalidInput("Mint address is empty");
 
-        var response = await _http.GetAsync(
-            $"https://api.dexscreener.com/latest/dex/tokens/{mintAddress}");
+        if (!MintAddressRegex.IsMatch(mintAddress))
+        {
+            Log($"Invalid mint format: {Truncate(mintAddress)}");
+            return new AnalysisInvalidInput(
+                "Address is not a valid Solana mint format (must be 32-44 Base58 characters)");
+        }
+
+        try
+        {
+            return await AnalyzeInternalAsync(mintAddress);
+        }
+        catch (HttpRequestException ex)
+        {
+            Log($"Network error: {ex.Message}");
+            return new AnalysisUpstreamError($"Could not reach DexScreener: {ex.Message}");
+        }
+        catch (JsonException ex)
+        {
+            Log($"JSON parse error: {ex.Message}");
+            return new AnalysisUpstreamError("DexScreener returned invalid JSON");
+        }
+        catch (Exception ex)
+        {
+            Log($"Unexpected error: {ex.GetType().Name}: {ex.Message}");
+            return new AnalysisUpstreamError($"Analysis failed: {ex.Message}");
+        }
+    }
+
+    private async Task<AnalysisOutcome> AnalyzeInternalAsync(string mintAddress)
+    {
+        var url = $"https://api.dexscreener.com/latest/dex/tokens/{mintAddress}";
+        Log($"GET {url}");
+
+        var response = await _http.GetAsync(url);
+        Log($"Response: HTTP {(int)response.StatusCode}");
 
         if (!response.IsSuccessStatusCode)
-            return null;
+            return new AnalysisUpstreamError($"DexScreener returned HTTP {(int)response.StatusCode}");
 
         var json = await response.Content.ReadAsStringAsync();
         using var doc = JsonDocument.Parse(json);
 
-        if (!doc.RootElement.TryGetProperty("pairs", out var pairs) || pairs.GetArrayLength() == 0)
-            return null;
+        if (!doc.RootElement.TryGetProperty("pairs", out var pairs))
+        {
+            Log("Response missing 'pairs' field");
+            return new AnalysisNotFound(
+                "DexScreener has no record of this address",
+                $"Verify the mint on solscan.io/token/{mintAddress}");
+        }
+
+        if (pairs.ValueKind == JsonValueKind.Null)
+        {
+            Log("'pairs' field is null — address unknown to DexScreener");
+            return new AnalysisNotFound(
+                "DexScreener returned no pools for this address",
+                "Common causes: the address is a pair/pool address (not a token mint), the token was delisted or rugged, " +
+                "the address is a wallet or NFT, or the token is too new to be indexed. " +
+                $"Verify on solscan.io/token/{mintAddress}");
+        }
+
+        if (pairs.ValueKind != JsonValueKind.Array)
+        {
+            Log($"Unexpected 'pairs' type: {pairs.ValueKind}");
+            return new AnalysisUpstreamError("Unexpected response format from DexScreener");
+        }
+
+        if (pairs.GetArrayLength() == 0)
+        {
+            Log("'pairs' is an empty array");
+            return new AnalysisNotFound(
+                "DexScreener has no active pools for this token",
+                "The token may be delisted, abandoned, or have had all liquidity removed");
+        }
+
+        Log($"Found {pairs.GetArrayLength()} total pools across all chains");
 
         // Find the Solana pool with the highest liquidity
         JsonElement? topPool = null;
         double topLiquidity = 0;
+        int solanaCount = 0;
 
         foreach (var pair in pairs.EnumerateArray())
         {
             if (pair.TryGetProperty("chainId", out var chain) && chain.GetString() == "solana")
             {
+                solanaCount++;
                 double liq = 0;
                 if (pair.TryGetProperty("liquidity", out var liquidity) &&
-                    liquidity.TryGetProperty("usd", out var usd))
+                    liquidity.TryGetProperty("usd", out var usd) &&
+                    usd.ValueKind == JsonValueKind.Number)
                     liq = usd.GetDouble();
 
                 if (liq > topLiquidity)
@@ -58,8 +125,14 @@ public class TokenAnalyzer
             }
         }
 
+        Log($"Solana pools: {solanaCount}, top liquidity: ${topLiquidity:N0}");
+
         if (topPool == null)
-            return null;
+        {
+            return new AnalysisNotFound(
+                "Token exists on DexScreener but has no Solana pools",
+                "This detector only analyzes Solana tokens. The token may only trade on other chains");
+        }
 
         var pool = topPool.Value;
 
@@ -70,6 +143,7 @@ public class TokenAnalyzer
         );
 
         var poolCreatedAt = pool.TryGetProperty("pairCreatedAt", out var created)
+            && created.ValueKind == JsonValueKind.Number
             ? created.GetInt64() : 0;
 
         var poolInfo = new PoolInfo(
@@ -85,7 +159,9 @@ public class TokenAnalyzer
             TotalPools: pairs.GetArrayLength()
         );
 
-        return ScoreRisk(tokenInfo, poolInfo, poolCreatedAt);
+        Log($"Analyzing {tokenInfo.Symbol} on {poolInfo.Dex}");
+
+        return new AnalysisFound(ScoreRisk(tokenInfo, poolInfo, poolCreatedAt));
     }
 
     private static TokenAnalysis ScoreRisk(TokenInfo token, PoolInfo pool, long poolCreatedAt)
@@ -182,6 +258,11 @@ public class TokenAnalyzer
         return new TokenAnalysis(token, pool, overallRisk, score, flags);
     }
 
+    private static void Log(string message)
+        => Console.Error.WriteLine($"[TokenAnalyzer] {message}");
+
+    private static string Truncate(string s) => s.Length > 20 ? s[..20] + "..." : s;
+
     // JSON extraction helpers
     private static string? GetString(JsonElement el, string prop)
         => el.TryGetProperty(prop, out var val) ? val.GetString() : null;
@@ -223,3 +304,13 @@ public record RiskFlag(string Level, string Message);
 public record TokenAnalysis(
     TokenInfo Token, PoolInfo TopPool, string OverallRisk,
     int RiskScore, List<RiskFlag> Flags);
+
+/// <summary>
+/// Result of a token analysis request. Uses a discriminated union so callers
+/// can pattern-match on the specific outcome and return appropriate responses.
+/// </summary>
+public abstract record AnalysisOutcome;
+public sealed record AnalysisFound(TokenAnalysis Analysis) : AnalysisOutcome;
+public sealed record AnalysisNotFound(string Reason, string Suggestion) : AnalysisOutcome;
+public sealed record AnalysisInvalidInput(string Reason) : AnalysisOutcome;
+public sealed record AnalysisUpstreamError(string Reason) : AnalysisOutcome;

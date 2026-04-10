@@ -154,11 +154,29 @@ app.MapPost("/api/check", (ManualCheckRequest req) =>
 
 app.MapGet("/api/analyze/{mintAddress}", async (string mintAddress) =>
 {
-    var analysis = await tokenAnalyzer.AnalyzeAsync(mintAddress);
-    if (analysis == null)
-        return Results.NotFound(new { error = $"No pools found for {mintAddress}" });
-
-    return Results.Ok(analysis);
+    var outcome = await tokenAnalyzer.AnalyzeAsync(mintAddress);
+    return outcome switch
+    {
+        AnalysisFound found => Results.Ok(found.Analysis),
+        AnalysisNotFound nf => Results.NotFound(new
+        {
+            error = "Token not found",
+            mintAddress,
+            reason = nf.Reason,
+            suggestion = nf.Suggestion
+        }),
+        AnalysisInvalidInput invalid => Results.BadRequest(new
+        {
+            error = "Invalid mint address",
+            mintAddress,
+            reason = invalid.Reason
+        }),
+        AnalysisUpstreamError err => Results.Problem(
+            title: "Upstream API error",
+            detail: err.Reason,
+            statusCode: 502),
+        _ => Results.StatusCode(500)
+    };
 })
 .RequireRateLimiting("api");
 
