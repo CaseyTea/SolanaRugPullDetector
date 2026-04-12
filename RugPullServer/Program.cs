@@ -1,11 +1,17 @@
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.RateLimiting;
+using DotNetEnv;
 using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.ML;
 using RugPullShared;
 using RugPullServer;
+
+// Load environment variables from .env if present. Silent when absent so the
+// zero-config quickstart flow still works. Must run before any env var reads
+// and before the --mcp branch so MCP stdio mode also picks up .env values.
+Env.TraversePath().Load();
 
 var mlContext = new MLContext();
 mlContext.ComponentCatalog.RegisterAssembly(typeof(RugPullData).Assembly);
