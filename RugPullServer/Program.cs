@@ -17,7 +17,33 @@ var mlContext = new MLContext();
 mlContext.ComponentCatalog.RegisterAssembly(typeof(RugPullData).Assembly);
 var model = mlContext.Model.Load("rugpull_model.zip", out _);
 var predictionEngine = mlContext.Model.CreatePredictionEngine<RugPullData, RugPullPrediction>(model);
-var tokenAnalyzer = new TokenAnalyzer(new HttpClient());
+
+// HELIUS_API_KEY gates the live ML feature extraction path. If absent,
+// HeliusFeatureExtractor returns null gracefully and /api/analyze responds
+// with mlPrediction: null + an mlError string — heuristic signals still work.
+var heliusApiKey = Environment.GetEnvironmentVariable("HELIUS_API_KEY") ?? "";
+if (string.IsNullOrEmpty(heliusApiKey))
+{
+    Console.Error.WriteLine(
+        "WARNING: HELIUS_API_KEY environment variable is not set. ML live inference is DISABLED — /api/analyze will return mlPrediction: null");
+}
+else
+{
+    Console.Error.WriteLine(
+        $"HELIUS_API_KEY loaded (length={heliusApiKey.Length}, prefix={heliusApiKey[..Math.Min(4, heliusApiKey.Length)]}...). ML live inference enabled.");
+}
+
+var heliusExtractor = new HeliusFeatureExtractor(new HttpClient(), heliusApiKey);
+
+// AnalysisCache needs an IMemoryCache. For the MCP + main-path shared case we
+// build a small standalone cache instance here so both code paths share the
+// same wiring shape. The DI registration below mirrors this for the HTTP path.
+var sharedMemoryCache = new Microsoft.Extensions.Caching.Memory.MemoryCache(
+    new Microsoft.Extensions.Caching.Memory.MemoryCacheOptions { SizeLimit = 10_000 });
+var sharedAnalysisCache = new AnalysisCache(sharedMemoryCache);
+
+var tokenAnalyzer = new TokenAnalyzer(
+    new HttpClient(), heliusExtractor, sharedAnalysisCache, predictionEngine);
 
 if (args.Contains("--mcp"))
 {
@@ -75,7 +101,10 @@ builder.Services.AddRateLimiter(options =>
 });
 
 builder.Services.AddMemoryCache(options => { options.SizeLimit = 10_000; });
-builder.Services.AddSingleton<AnalysisCache>();
+builder.Services.AddSingleton<AnalysisCache>(sharedAnalysisCache);
+builder.Services.AddSingleton(heliusExtractor);
+builder.Services.AddSingleton(predictionEngine);
+builder.Services.AddSingleton(tokenAnalyzer);
 
 var app = builder.Build();
 

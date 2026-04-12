@@ -1,22 +1,52 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using Microsoft.ML;
+using RugPullShared;
 
 namespace RugPullServer;
 
 /// <summary>
 /// Fetches live token data from DexScreener and runs heuristic risk scoring.
-/// No API key required. Rate limit ~300 req/min.
+/// Also orchestrates the live ML inference path: extracts SolRPDS features
+/// from Helius (cached per-mint), runs the trained FastTree model, and
+/// merges both outputs into a single <see cref="AnalysisResponse"/>.
+///
+/// DexScreener has no API key requirement (rate limit ~300 req/min). Helius
+/// requires HELIUS_API_KEY; when unset, the extractor returns null and we
+/// populate <c>MlError</c> accordingly so heuristic signals still flow.
 /// </summary>
 public class TokenAnalyzer
 {
     private static readonly Regex MintAddressRegex = new(
         @"^[1-9A-HJ-NP-Za-km-z]{32,44}$", RegexOptions.Compiled);
 
-    private readonly HttpClient _http;
+    // Model metadata is hard-coded here. When a new model is trained this
+    // constant gets bumped by hand. Not worth automating for a demo app.
+    private static readonly ModelInfo CurrentModel = new(
+        Version: "fasttree-1.0",
+        TrainingDataset: "SolRPDS 2021-2024",
+        TrainingAccuracy: 0.866f,
+        TrainingAuc: 0.895f);
 
-    public TokenAnalyzer(HttpClient http)
+    private readonly HttpClient _http;
+    private readonly HeliusFeatureExtractor _heliusExtractor;
+    private readonly AnalysisCache _cache;
+    private readonly PredictionEngine<RugPullData, RugPullPrediction> _predictionEngine;
+
+    // PredictionEngine is not thread-safe. Guard it with a lock so concurrent
+    // /api/analyze requests don't race into Predict() at the same time.
+    private readonly object _predictionLock = new();
+
+    public TokenAnalyzer(
+        HttpClient http,
+        HeliusFeatureExtractor heliusExtractor,
+        AnalysisCache cache,
+        PredictionEngine<RugPullData, RugPullPrediction> predictionEngine)
     {
         _http = http;
+        _heliusExtractor = heliusExtractor;
+        _cache = cache;
+        _predictionEngine = predictionEngine;
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("RugPullDetector/1.0");
     }
 
@@ -183,13 +213,135 @@ public class TokenAnalyzer
 
         var marketSignals = ScoreRisk(marketData, poolCreatedAtMs);
 
+        // Live ML inference path: cache-then-Helius feature extraction, then
+        // feed the 5 SolRPDS features into the trained FastTree model. Any
+        // failure leaves mlPrediction null and populates mlError with a
+        // human-readable reason so the heuristic sections still return cleanly.
+        MlPrediction? mlPrediction = null;
+        string? mlError = null;
+
+        try
+        {
+            var (features, error) = await GetFeaturesAsync(mintAddress, marketData.PairAddress);
+            if (features is null)
+            {
+                mlError = error ?? "Feature extraction failed";
+                Log($"ML path skipped: {mlError}");
+            }
+            else
+            {
+                mlPrediction = RunPrediction(features);
+            }
+        }
+        catch (Exception ex)
+        {
+            mlError = $"ML inference failed: {ex.GetType().Name}: {ex.Message}";
+            Log(mlError);
+        }
+
         return new AnalysisFound(new AnalysisResponse(
             Token: tokenRef,
-            MlPrediction: null,
-            MlError: null,
+            MlPrediction: mlPrediction,
+            MlError: mlError,
             MarketSignals: marketSignals,
             MarketData: marketData,
-            Agreement: ComputeAgreement(null, marketSignals)));
+            Agreement: ComputeAgreement(mlPrediction, marketSignals)));
+    }
+
+    /// <summary>
+    /// Resolve SolRPDS features for a mint, consulting the in-memory cache
+    /// first (keyed by mint) and falling back to Helius. Returns a tuple of
+    /// (features, errorReason); exactly one side is non-null. When Helius
+    /// yields non-null features they are cached for 10 minutes. Null returns
+    /// are NOT cached so transient failures get retried on the next request.
+    /// </summary>
+    private async Task<(HeliusFeatures? features, string? error)> GetFeaturesAsync(
+        string mintAddress, string poolAddress)
+    {
+        if (string.IsNullOrEmpty(poolAddress))
+            return (null, "No pool address available for feature extraction");
+
+        // Tracks why the factory returned null so we can surface a clean
+        // mlError upstream even though AnalysisCache deliberately does not
+        // cache nulls (it would be wrong to persist a transient failure).
+        string? factoryError = null;
+
+        var features = await _cache.GetOrSetAsync(mintAddress, async () =>
+        {
+            var result = await _heliusExtractor.ExtractAsync(poolAddress);
+            if (result is null)
+            {
+                factoryError = string.IsNullOrEmpty(Environment.GetEnvironmentVariable("HELIUS_API_KEY"))
+                    ? "HELIUS_API_KEY not configured"
+                    : "Helius feature extraction failed";
+            }
+            return result;
+        });
+
+        if (features is null)
+            return (null, factoryError ?? "Feature extraction failed");
+
+        return (features, null);
+    }
+
+    /// <summary>
+    /// Maps <see cref="HeliusFeatures"/> into a <see cref="RugPullData"/>,
+    /// runs the FastTree PredictionEngine under a lock (the engine is not
+    /// thread-safe), and builds the <see cref="MlPrediction"/> response
+    /// record with derived verdict, risk level, and model metadata.
+    /// </summary>
+    private MlPrediction RunPrediction(HeliusFeatures features)
+    {
+        var input = new RugPullData
+        {
+            TotalAddedLiquidity = features.TotalAddedLiquidity,
+            TotalRemovedLiquidity = features.TotalRemovedLiquidity,
+            NumLiquidityAdds = features.NumLiquidityAdds,
+            NumLiquidityRemoves = features.NumLiquidityRemoves,
+            // SolRPDS represents an "infinite" ratio (removes == 0) as a very
+            // large float. PositiveInfinity would poison the model input, so
+            // clamp to a finite sentinel that still reads as "no removes yet".
+            AddToRemoveRatio = float.IsFinite(features.AddToRemoveRatio)
+                ? features.AddToRemoveRatio
+                : 1_000_000f
+        };
+
+        RugPullPrediction prediction;
+        lock (_predictionLock)
+        {
+            prediction = _predictionEngine.Predict(input);
+        }
+
+        var probability = prediction.Probability;
+        var verdict = probability > 0.5f ? "LIKELY RUG PULL" : "LIKELY LEGITIMATE";
+        var riskLevel = probability switch
+        {
+            > 0.9f => "CRITICAL",
+            > 0.75f => "HIGH",
+            > 0.5f => "MEDIUM",
+            _ => "LOW"
+        };
+
+        var mlFeatures = new MlFeatures(
+            TotalAddedLiquidity: features.TotalAddedLiquidity,
+            TotalRemovedLiquidity: features.TotalRemovedLiquidity,
+            NumLiquidityAdds: features.NumLiquidityAdds,
+            NumLiquidityRemoves: features.NumLiquidityRemoves,
+            AddToRemoveRatio: input.AddToRemoveRatio);
+
+        var cachedAtIso = DateTimeOffset.UtcNow
+            .UtcDateTime
+            .ToString("yyyy-MM-ddTHH:mm:ssZ");
+
+        return new MlPrediction(
+            Verdict: verdict,
+            Probability: probability,
+            RawScore: prediction.Score,
+            RiskLevel: riskLevel,
+            Features: mlFeatures,
+            FeaturesSource: "helius",
+            FeaturesCachedAt: cachedAtIso,
+            Model: CurrentModel);
     }
 
     private static MarketSignalsBlock ScoreRisk(MarketData pool, long poolCreatedAtMs)
@@ -289,17 +441,30 @@ public class TokenAnalyzer
     }
 
     /// <summary>
-    /// Compares the ML verdict with the heuristic verdict and returns a string
-    /// indicating whether they agree. Story 5 will implement the real logic
-    /// (agree / disagree / ml_says_safer / ml_says_riskier). For Story 4 we
-    /// only have the heuristic path, so this always returns "not_evaluated".
+    /// Compares the ML verdict with the heuristic verdict and classifies the
+    /// pair as agree / conflict / partial / ml_unavailable.
+    ///
+    /// Rules:
+    ///   - null ML           → ml_unavailable
+    ///   - rug (p>0.5)  + HIGH/CRITICAL heuristic → agree
+    ///   - legit (p<=0.5) + LOW heuristic         → agree
+    ///   - rug (p>0.5)  + LOW heuristic           → conflict
+    ///   - legit (p<=0.5) + CRITICAL heuristic    → conflict
+    ///   - everything else                        → partial
     /// </summary>
     public static string ComputeAgreement(MlPrediction? ml, MarketSignalsBlock market)
     {
-        // Story 5: replace this with the real comparison once ML predictions
-        // are wired in via Helius feature extraction.
-        if (ml is null) return "not_evaluated";
-        return "not_evaluated";
+        if (ml is null) return "ml_unavailable";
+
+        bool mlSaysRug = ml.Probability > 0.5f;
+        var risk = market.OverallRisk;
+
+        if (mlSaysRug && (risk == "HIGH" || risk == "CRITICAL")) return "agree";
+        if (!mlSaysRug && risk == "LOW") return "agree";
+        if (mlSaysRug && risk == "LOW") return "conflict";
+        if (!mlSaysRug && risk == "CRITICAL") return "conflict";
+
+        return "partial";
     }
 
     private static void Log(string message)
