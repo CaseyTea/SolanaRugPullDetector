@@ -14,3 +14,9 @@ rugpull_model.zip
 
 # Dataset repo (cloned separately)
 SolRPDS/
+
+# Environment files — never commit secrets
+# .env.example IS committed as a template (see ! rule below)
+.env
+.env.*
+!.env.example
