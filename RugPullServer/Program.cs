@@ -74,6 +74,9 @@ builder.Services.AddRateLimiter(options =>
     });
 });
 
+builder.Services.AddMemoryCache(options => { options.SizeLimit = 10_000; });
+builder.Services.AddSingleton<AnalysisCache>();
+
 var app = builder.Build();
 
 if (trustProxy)
