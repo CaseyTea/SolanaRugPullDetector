@@ -136,35 +136,63 @@ public class TokenAnalyzer
 
         var pool = topPool.Value;
 
-        var tokenInfo = new TokenInfo(
+        var tokenRef = new TokenRef(
             Name: GetString(pool, "baseToken", "name") ?? "Unknown",
             Symbol: GetString(pool, "baseToken", "symbol") ?? "???",
             MintAddress: mintAddress
         );
 
-        var poolCreatedAt = pool.TryGetProperty("pairCreatedAt", out var created)
+        var poolCreatedAtMs = pool.TryGetProperty("pairCreatedAt", out var created)
             && created.ValueKind == JsonValueKind.Number
             ? created.GetInt64() : 0;
 
-        var poolInfo = new PoolInfo(
+        // Parse priceUsd — DexScreener returns it as a string.
+        var priceUsdStr = GetString(pool, "priceUsd") ?? "0";
+        double priceUsd = double.TryParse(priceUsdStr, out var p) ? p : 0;
+
+        var volume24hUsd = GetNestedDouble(pool, "volume", "h24");
+        var priceChange24h = GetNestedDouble(pool, "priceChange", "h24");
+        var buys24h = GetNestedInt(pool, "txns", "h24", "buys");
+        var sells24h = GetNestedInt(pool, "txns", "h24", "sells");
+
+        var poolCreatedAtIso = poolCreatedAtMs > 0
+            ? DateTimeOffset.FromUnixTimeMilliseconds(poolCreatedAtMs)
+                .UtcDateTime
+                .ToString("yyyy-MM-ddTHH:mm:ssZ")
+            : "";
+
+        var poolAgeHours = poolCreatedAtMs > 0
+            ? (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - poolCreatedAtMs) / 3_600_000.0
+            : 0;
+
+        var marketData = new MarketData(
             Dex: GetString(pool, "dexId") ?? "unknown",
             PairAddress: GetString(pool, "pairAddress") ?? "",
             LiquidityUsd: topLiquidity,
-            Volume24h: GetNestedDouble(pool, "volume", "h24"),
-            PriceUsd: GetString(pool, "priceUsd") ?? "0",
-            CreatedAtMs: poolCreatedAt,
-            Buys24h: GetNestedInt(pool, "txns", "h24", "buys"),
-            Sells24h: GetNestedInt(pool, "txns", "h24", "sells"),
-            PriceChange24h: GetNestedDouble(pool, "priceChange", "h24"),
+            Volume24hUsd: volume24hUsd,
+            PriceUsd: priceUsd,
+            PriceChange24hPercent: priceChange24h,
+            Buys24h: buys24h,
+            Sells24h: sells24h,
+            PoolCreatedAt: poolCreatedAtIso,
+            PoolAgeHours: Math.Round(poolAgeHours, 1),
             TotalPools: pairs.GetArrayLength()
         );
 
-        Log($"Analyzing {tokenInfo.Symbol} on {poolInfo.Dex}");
+        Log($"Analyzing {tokenRef.Symbol} on {marketData.Dex}");
 
-        return new AnalysisFound(ScoreRisk(tokenInfo, poolInfo, poolCreatedAt));
+        var marketSignals = ScoreRisk(marketData, poolCreatedAtMs);
+
+        return new AnalysisFound(new AnalysisResponse(
+            Token: tokenRef,
+            MlPrediction: null,
+            MlError: null,
+            MarketSignals: marketSignals,
+            MarketData: marketData,
+            Agreement: ComputeAgreement(null, marketSignals)));
     }
 
-    private static TokenAnalysis ScoreRisk(TokenInfo token, PoolInfo pool, long poolCreatedAt)
+    private static MarketSignalsBlock ScoreRisk(MarketData pool, long poolCreatedAtMs)
     {
         var flags = new List<RiskFlag>();
         int score = 0;
@@ -172,76 +200,78 @@ public class TokenAnalyzer
         // Liquidity depth
         if (pool.LiquidityUsd < 1_000)
         {
-            flags.Add(new RiskFlag("danger", $"Extremely low liquidity (${pool.LiquidityUsd:N0})"));
+            flags.Add(new RiskFlag("danger", "liquidity", $"Extremely low liquidity (${pool.LiquidityUsd:N0})", pool.LiquidityUsd));
             score += 3;
         }
         else if (pool.LiquidityUsd < 10_000)
         {
-            flags.Add(new RiskFlag("warning", $"Low liquidity (${pool.LiquidityUsd:N0})"));
+            flags.Add(new RiskFlag("warning", "liquidity", $"Low liquidity (${pool.LiquidityUsd:N0})", pool.LiquidityUsd));
             score += 2;
         }
         else if (pool.LiquidityUsd < 50_000)
         {
-            flags.Add(new RiskFlag("info", $"Moderate liquidity (${pool.LiquidityUsd:N0})"));
+            flags.Add(new RiskFlag("info", "liquidity", $"Moderate liquidity (${pool.LiquidityUsd:N0})", pool.LiquidityUsd));
             score += 1;
         }
         else
         {
-            flags.Add(new RiskFlag("ok", $"Healthy liquidity (${pool.LiquidityUsd:N0})"));
+            flags.Add(new RiskFlag("ok", "liquidity", $"Healthy liquidity (${pool.LiquidityUsd:N0})", pool.LiquidityUsd));
         }
 
         // Buy/sell pressure
         if (pool.Buys24h + pool.Sells24h > 0)
         {
             double sellRatio = pool.Sells24h / (double)Math.Max(pool.Buys24h, 1);
+            double roundedRatio = Math.Round(sellRatio, 2);
             if (sellRatio > 2.0)
             {
-                flags.Add(new RiskFlag("danger", $"Heavy sell pressure: {pool.Sells24h} sells vs {pool.Buys24h} buys (24h)"));
+                flags.Add(new RiskFlag("danger", "volume", $"Heavy sell pressure: {pool.Sells24h} sells vs {pool.Buys24h} buys (24h)", roundedRatio));
                 score += 2;
             }
             else if (sellRatio > 1.0)
             {
-                flags.Add(new RiskFlag("warning", $"More sells than buys: {pool.Sells24h} sells vs {pool.Buys24h} buys (24h)"));
+                flags.Add(new RiskFlag("warning", "volume", $"More sells than buys: {pool.Sells24h} sells vs {pool.Buys24h} buys (24h)", roundedRatio));
                 score += 1;
             }
             else
             {
-                flags.Add(new RiskFlag("ok", $"Healthy trading: {pool.Buys24h} buys vs {pool.Sells24h} sells (24h)"));
+                flags.Add(new RiskFlag("ok", "volume", $"Healthy trading: {pool.Buys24h} buys vs {pool.Sells24h} sells (24h)", roundedRatio));
             }
         }
 
         // Price crash detection
-        if (pool.PriceChange24h < -50)
+        if (pool.PriceChange24hPercent < -50)
         {
-            flags.Add(new RiskFlag("danger", $"Price crashed {pool.PriceChange24h:F1}% in 24h"));
+            flags.Add(new RiskFlag("danger", "price", $"Price crashed {pool.PriceChange24hPercent:F1}% in 24h", pool.PriceChange24hPercent));
             score += 2;
         }
-        else if (pool.PriceChange24h < -20)
+        else if (pool.PriceChange24hPercent < -20)
         {
-            flags.Add(new RiskFlag("warning", $"Price down {pool.PriceChange24h:F1}% in 24h"));
+            flags.Add(new RiskFlag("warning", "price", $"Price down {pool.PriceChange24hPercent:F1}% in 24h", pool.PriceChange24hPercent));
             score += 1;
         }
 
         // Token age
-        if (poolCreatedAt > 0)
+        if (poolCreatedAtMs > 0)
         {
-            var ageHours = (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - poolCreatedAt) / 3_600_000.0;
+            var ageHours = (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - poolCreatedAtMs) / 3_600_000.0;
             if (ageHours < 24)
             {
-                flags.Add(new RiskFlag("warning", $"Very new token: pool created {ageHours:F0} hours ago"));
+                flags.Add(new RiskFlag("warning", "age", $"Very new token: pool created {ageHours:F0} hours ago", Math.Round(ageHours, 1)));
                 score += 2;
             }
             else if (ageHours < 168)
             {
-                flags.Add(new RiskFlag("info", $"Young token: pool created {ageHours / 24:F0} days ago"));
+                flags.Add(new RiskFlag("info", "age", $"Young token: pool created {ageHours / 24:F0} days ago", Math.Round(ageHours, 1)));
                 score += 1;
             }
         }
 
         // Wash trading signal
-        if (pool.LiquidityUsd > 0 && pool.Volume24h > pool.LiquidityUsd * 10)
+        if (pool.LiquidityUsd > 0 && pool.Volume24hUsd > pool.LiquidityUsd * 10)
         {
-            flags.Add(new RiskFlag("warning", "Volume exceeds 10x liquidity — possible wash trading"));
+            double volToLiq = Math.Round(pool.Volume24hUsd / pool.LiquidityUsd, 2);
+            flags.Add(new RiskFlag("warning", "wash_trading", "Volume exceeds 10x liquidity — possible wash trading", volToLiq));
             score += 1;
         }
 
@@ -255,7 +285,21 @@ public class TokenAnalyzer
             _ => "LOW"
         };
 
-        return new TokenAnalysis(token, pool, overallRisk, score, flags);
+        return new MarketSignalsBlock(overallRisk, score, flags);
+    }
+
+    /// <summary>
+    /// Compares the ML verdict with the heuristic verdict and returns a string
+    /// indicating whether they agree. Story 5 will implement the real logic
+    /// (agree / disagree / ml_says_safer / ml_says_riskier). For Story 4 we
+    /// only have the heuristic path, so this always returns "not_evaluated".
+    /// </summary>
+    public static string ComputeAgreement(MlPrediction? ml, MarketSignalsBlock market)
+    {
+        // Story 5: replace this with the real comparison once ML predictions
+        // are wired in via Helius feature extraction.
+        if (ml is null) return "not_evaluated";
+        return "not_evaluated";
     }
 
     private static void Log(string message)
@@ -292,25 +336,14 @@ public class TokenAnalyzer
     }
 }
 
-public record TokenInfo(string Name, string Symbol, string MintAddress);
-
-public record PoolInfo(
-    string Dex, string PairAddress, double LiquidityUsd, double Volume24h,
-    string PriceUsd, long CreatedAtMs, int Buys24h, int Sells24h,
-    double PriceChange24h, int TotalPools);
-
-public record RiskFlag(string Level, string Message);
-
-public record TokenAnalysis(
-    TokenInfo Token, PoolInfo TopPool, string OverallRisk,
-    int RiskScore, List<RiskFlag> Flags);
+public record RiskFlag(string Level, string Category, string Message, double Value);
 
 /// <summary>
 /// Result of a token analysis request. Uses a discriminated union so callers
 /// can pattern-match on the specific outcome and return appropriate responses.
 /// </summary>
 public abstract record AnalysisOutcome;
-public sealed record AnalysisFound(TokenAnalysis Analysis) : AnalysisOutcome;
+public sealed record AnalysisFound(AnalysisResponse Response) : AnalysisOutcome;
 public sealed record AnalysisNotFound(string Reason, string Suggestion) : AnalysisOutcome;
 public sealed record AnalysisInvalidInput(string Reason) : AnalysisOutcome;
 public sealed record AnalysisUpstreamError(string Reason) : AnalysisOutcome;

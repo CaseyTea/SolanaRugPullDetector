@@ -163,7 +163,7 @@ app.MapGet("/api/analyze/{mintAddress}", async (string mintAddress) =>
     var outcome = await tokenAnalyzer.AnalyzeAsync(mintAddress);
     return outcome switch
     {
-        AnalysisFound found => Results.Ok(found.Analysis),
+        AnalysisFound found => Results.Ok(found.Response),
         AnalysisNotFound nf => Results.NotFound(new
         {
             error = "Token not found",

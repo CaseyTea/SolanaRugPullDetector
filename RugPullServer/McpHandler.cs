@@ -141,7 +141,7 @@ public static class McpHandler
 
         object payload = outcome switch
         {
-            AnalysisFound found => (object)found.Analysis,
+            AnalysisFound found => (object)found.Response,
             AnalysisNotFound nf => new
             {
                 error = "Token not found",
